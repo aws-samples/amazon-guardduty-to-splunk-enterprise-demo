@@ -1,0 +1,365 @@
+Parameters:
+
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.10.0.0/16
+
+  PublicSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 10.10.10.0/24
+
+  PublicSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the second Availability Zone
+    Type: String
+    Default: 10.10.11.0/24
+
+  AllowedIP:
+    Description: Allowed IP range for Splunk
+    Type: String
+    Default: 0.0.0.0/0
+
+  SplunkAmiId:
+    Type: String
+    Default: ami-0f7a62ef867109fe1
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Join [ '', ['VPC'] ]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join [ '', ['IGW'] ]
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: "Public Subnet (AZ1)"
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: "Public Subnet (AZ2)"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public Routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  SplunkRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Join:
+        - ''
+        - ['Splunk-role']
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+
+  SplunkInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName:
+        Fn::Join:
+        - ''
+        - ['Splunk-profile']
+      Path: /
+      Roles:
+        - !Ref SplunkRole
+
+
+  # ALB for Splunk
+  ALBSplunk:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+      - Ref: PublicSubnet1
+      - Ref: PublicSubnet2
+      SecurityGroups:
+      - Ref: ALBSplunkSG
+
+  ALBSplunkListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn:
+            Ref: SplunkWebTargetGroup
+      LoadBalancerArn:
+          Ref: ALBSplunk
+      Port: 80
+      Protocol: HTTP
+
+  ALBSplunkHECListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn:
+            Ref: SplunkHECTargetGroup
+      LoadBalancerArn:
+          Ref: ALBSplunk
+      Port: 8088
+      Protocol: HTTP
+
+#  ALB Security Group with Allowed IPs
+  ALBSplunkSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupDescription: 'Splunk-alb'
+        VpcId:
+          Ref: VPC
+        SecurityGroupIngress:
+            - IpProtocol: tcp
+              CidrIp: !Ref AllowedIP
+              FromPort: 80
+              ToPort: 80
+            - IpProtocol: tcp
+              CidrIp: !Ref AllowedIP
+              FromPort: 8088
+              ToPort: 8088
+
+  SplunkWebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 5
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 3
+      HealthyThresholdCount: 3
+      HealthCheckPath: '/api/health'
+      Matcher:
+        HttpCode: '200'
+      Name: SplunkWebTargetGroup
+      Port: 8000
+      Protocol: HTTP
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: '10'
+      UnhealthyThresholdCount: 3
+      VpcId:
+        Ref: 'VPC'
+      TargetType: instance
+      Targets:
+      - Id: !Ref SplunkInstance
+
+  SplunkHECTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 5
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 3
+      HealthyThresholdCount: 3
+      HealthCheckPath: '/services/collector/health'
+      Matcher:
+        HttpCode: '200'
+      Name: SplunkHECTargetGroup
+      Port: 8088
+      Protocol: HTTP
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: '10'
+      UnhealthyThresholdCount: 3
+      VpcId:
+        Ref: 'VPC'
+      TargetType: instance
+      Targets:
+      - Id: !Ref SplunkInstance
+
+  SplunkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription:
+        Fn::Join:
+        - ''
+        - ['Splunk-sg']
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '8000'
+        ToPort: '8000'
+        SourceSecurityGroupId: !Ref ALBSplunkSG
+      - IpProtocol: tcp
+        FromPort: '8088'
+        ToPort: '8088'
+        SourceSecurityGroupId: !Ref ALBSplunkSG
+
+  SplunkInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      IamInstanceProfile: !Ref SplunkInstanceProfile
+      ImageId: !Ref SplunkAmiId
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref SplunkSecurityGroup
+          SubnetId:
+            Ref: PublicSubnet1
+      Tags:
+          - Key: Name
+            Value:
+              Fn::Join:
+              - ': '
+              - ['Splunk Instance']
+
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: True
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+
+  GuardDutyFindingEventToSplunk:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: 'guardduty-finding-to-splunk'
+      Description: "GuardDuty Finding to Splunk"
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - "GuardDuty Finding"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn: !GetAtt SplunkGuardDutyProcessorFunction.Arn
+          Id: "GuardDuty-Event-to-Splunk"
+
+  SplunkGuardDutyProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs10.x
+      Description: Stream findings from GuardDuty to Splunk's HTTP event collector
+      FunctionName: SplunkGuardDutyProcessorFunction
+      MemorySize: 512
+      Timeout: 30
+      Role:
+        Fn::GetAtt:
+          - "SplunkGuardDutyProcessorLambdaRole"
+          - "Arn"
+      Handler: index.handler
+      Code:
+        S3Bucket: amazon-guardduty-to-splunk
+        S3Key: splunk-guardduty-processor.zip
+      Environment:
+        Variables:
+          SPLUNK_HEC_URL: !Join ['', ['http://', !GetAtt ALBSplunk.DNSName, ':8088/services/collector/event']]
+          SPLUNK_HEC_TOKEN: REPLACE_WITH_HEC_TOKEN
+
+  GuardDutyProcessorLambdaInvokePermissions:
+    DependsOn:
+      - SplunkGuardDutyProcessorFunction
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref "SplunkGuardDutyProcessorFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+
+  SplunkGuardDutyProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: 'SplunkGuardDutyProcessorLambdaPolicy'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:DescribeLogStreams
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+
+  SplunkGuardDutyProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/SplunkGuardDutyProcessorFunction
+      RetentionInDays: 30
+
+Outputs:
+  ALBSplunkDNSName:
+    Description: "The DNS name for Splunk ALB."
+    Value: !GetAtt ALBSplunk.DNSName
+
+  SplunkUsername:
+    Description: "The Username name for Splunk."
+    Value: 'admin'
+
+  SplunkPassword:
+    Description: "The Password name for Splunk."
+    Value: !Join ['-', ['SPLUNK', !Ref SplunkInstance]]
