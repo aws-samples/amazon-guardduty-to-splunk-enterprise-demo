@@ -293,7 +293,7 @@ Resources:
   SplunkGuardDutyProcessorFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Runtime: nodejs10.x
+      Runtime: nodejs14.x
       Description: Stream findings from GuardDuty to Splunk's HTTP event collector
       FunctionName: SplunkGuardDutyProcessorFunction
       MemorySize: 512
